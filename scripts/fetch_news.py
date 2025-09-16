@@ -1,6 +1,10 @@
-from config import NEWS_API_KEY, DB_PATH
+from config import NEWS_API_KEY
 import requests
 import sqlite3
+import os
+
+DB_PATH = os.getenv("DB_PATH", "news.db")
+
 
 def assign_topic(title, description):
     text = (title or "") + " " + (description or "")

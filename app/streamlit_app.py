@@ -1,36 +1,36 @@
 import streamlit as st
 import sqlite3
-from config import DB_PATH
+import os
+
+DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "news.db")
 
 st.title("Personalized News Summarizer")
 
-# --- Connect to database ---
+# Connect to DB
 conn = sqlite3.connect(DB_PATH)
 c = conn.cursor()
 
-# --- Get all distinct topics from the database ---
+# Get topics
 c.execute("SELECT DISTINCT topic FROM articles")
-topics_in_db = [row[0] for row in c.fetchall()]
+topics = [row[0] for row in c.fetchall()]
 
-# --- Dropdown for topics ---
-topic = st.selectbox("Choose topic", topics_in_db)
+if topics:
+    topic = st.selectbox("Select a topic", topics)
 
-# --- Fetch articles for selected topic ---
-c.execute("SELECT title, summary, sentiment FROM articles WHERE topic=?", (topic,))
-filtered_articles = c.fetchall()
-conn.close()
+    c.execute(
+        "SELECT title, summary, sentiment, publishedAt FROM articles WHERE topic=? ORDER BY publishedAt DESC",
+        (topic,)
+    )
+    rows = c.fetchall()
 
-# --- Debug info (optional) ---
-st.write(f"Selected topic: {topic}")
-st.write(f"Number of articles fetched: {len(filtered_articles)}")
-
-# --- Display articles ---
-if len(filtered_articles) == 0:
-    st.write(f"No articles found for '{topic}' yet. Please fetch/update news first.")
+    if rows:
+        for title, summary, sentiment, publishedAt in rows:
+            st.subheader(title)
+            st.write(summary)
+            st.caption(f"Sentiment: {sentiment} | Published: {publishedAt}")
+    else:
+        st.warning(f"No articles found for '{topic}' yet. Please fetch/update news first.")
 else:
-    for article in filtered_articles:
-        title, summary, sentiment = article
-        st.subheader(title)
-        st.write(summary)
-        st.write(f"Sentiment: {sentiment}")
-        st.markdown("---")
+    st.warning("No topics found. Please fetch/update news first.")
+
+conn.close()
