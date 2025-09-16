@@ -1,0 +1,6 @@
+requests
+transformers
+sentence-transformers
+torch
+streamlit
+pandas
