@@ -42,7 +42,11 @@ url = f"https://newsapi.org/v2/top-headlines?country=us&apiKey={NEWS_API_KEY}"
 response = requests.get(url).json()
 articles = response.get("articles", [])
 
-summarizer = pipeline("summarization")
+summarizer = pipeline(
+    "summarization",
+    model="sshleifer/distilbart-cnn-12-6",
+    revision="a4f8f3e"
+)
 sentiment_analyzer = pipeline("sentiment-analysis")
 
 new_count = 0
