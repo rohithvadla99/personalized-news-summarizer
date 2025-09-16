@@ -1,6 +1,7 @@
 import sqlite3
+import os
 
-DB_PATH = "news.db"
+DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "news.db")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -15,7 +16,8 @@ def init_db():
             publishedAt TEXT,
             summary TEXT,
             sentiment TEXT,
-            topic TEXT
+            topic TEXT,
+            UNIQUE(title, source)
         )
     ''')
     conn.commit()
@@ -23,4 +25,4 @@ def init_db():
 
 if __name__ == "__main__":
     init_db()
-    print("Database initialized with 'articles' table.")
+    print("Database initialized with UNIQUE constraint on (title, source).")
