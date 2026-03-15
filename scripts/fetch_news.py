@@ -1,94 +1,104 @@
 import sqlite3
 import os
 import requests
-import streamlit as st  # For accessing secrets on Streamlit Cloud
-from transformers import pipeline
 
-# -----------------------
-# Config
-# -----------------------
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "news.db")
+from config     import DB_PATH, NEWS_API_KEY, TOPICS
+from preprocess import clean_text
+from summarize  import summarize
+from sentiment  import analyze_sentiment
 
-# Use Streamlit secrets if available, otherwise fallback to environment variable
-try:
-    NEWS_API_KEY = st.secrets["NEWS_API_KEY"]
-except Exception:
-    NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+# NewsAPI category names that map to our TOPICS list
+NEWSAPI_CATEGORIES = {
+    "Sports":   "sports",
+    "Tech":     "technology",
+    "Politics": "general",
+    "Business": "business",
+}
 
-if not NEWS_API_KEY:
-    raise ValueError("Please set NEWS_API_KEY as environment variable or in Streamlit secrets")
 
-# -----------------------
-# Connect to DB
-# -----------------------
-conn = sqlite3.connect(DB_PATH)
-c = conn.cursor()
+def get_connection() -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS articles (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            title       TEXT,
+            content     TEXT,
+            description TEXT,
+            source      TEXT,
+            publishedAt TEXT,
+            summary     TEXT,
+            sentiment   TEXT,
+            topic       TEXT,
+            UNIQUE(title, source)
+        )
+    ''')
+    conn.commit()
+    return conn
 
-# Ensure table exists with UNIQUE constraint
-c.execute('''
-CREATE TABLE IF NOT EXISTS articles (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT,
-    content TEXT,
-    description TEXT,
-    source TEXT,
-    publishedAt TEXT,
-    summary TEXT,
-    sentiment TEXT,
-    topic TEXT,
-    UNIQUE(title, source)
-)
-''')
-conn.commit()
 
-# -----------------------
-# Fetch news function
-# -----------------------
-def fetch_and_store_news():
-    url = f"https://newsapi.org/v2/top-headlines?country=us&apiKey={NEWS_API_KEY}"
-    response = requests.get(url).json()
-    articles = response.get("articles", [])
+def fetch_and_store(api_key: str = NEWS_API_KEY) -> tuple:
+    """
+    Fetch articles from NewsAPI for each topic category separately,
+    so every article is guaranteed to have a correct topic assigned.
+    Returns (total_fetched, new_inserted).
+    """
+    if not api_key:
+        raise ValueError(
+            "NEWS_API_KEY is not set. Add it to .streamlit/secrets.toml."
+        )
 
-    summarizer = pipeline(
-        "summarization",
-        model="sshleifer/distilbart-cnn-12-6",
-        revision="a4f8f3e"
-    )
-    sentiment_analyzer = pipeline("sentiment-analysis")
-
+    conn      = get_connection()
+    c         = conn.cursor()
+    total     = 0
     new_count = 0
-    for article in articles:
-        title = article.get("title", "")
-        content = article.get("content") or article.get("description") or ""
-        description = article.get("description", "")
-        source = article.get("source", {}).get("name", "")
-        publishedAt = article.get("publishedAt", "")
-        topic = "Other"
 
-        if content:
-            summary = summarizer(content, max_length=100, min_length=30, do_sample=False)[0]['summary_text']
-            sentiment = sentiment_analyzer(content)[0]['label']
-        else:
-            summary = ""
-            sentiment = "Neutral"
+    for topic, category in NEWSAPI_CATEGORIES.items():
+        url = (
+            f"https://newsapi.org/v2/top-headlines"
+            f"?country=us&category={category}&pageSize=10&apiKey={api_key}"
+        )
 
-        # Insert only if not duplicate
-        c.execute('''
-            INSERT OR IGNORE INTO articles(title, content, description, source, publishedAt, summary, sentiment, topic)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (title, content, description, source, publishedAt, summary, sentiment, topic))
+        try:
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as e:
+            print(f"Network error fetching {topic}: {e}")
+            continue
 
-        if c.rowcount > 0:
-            new_count += 1
+        if data.get("status") != "ok":
+            print(f"NewsAPI error for {topic}: {data.get('message')}")
+            continue
+
+        articles = data.get("articles", [])
+        total += len(articles)
+
+        for article in articles:
+            title       = article.get("title") or ""
+            raw_content = article.get("content") or article.get("description") or ""
+            description = article.get("description") or ""
+            source      = article.get("source", {}).get("name") or ""
+            published   = article.get("publishedAt") or ""
+
+            content   = clean_text(raw_content)
+            summary   = summarize(content)
+            sentiment = analyze_sentiment(content)
+
+            c.execute('''
+                INSERT OR IGNORE INTO articles
+                    (title, content, description, source, publishedAt, summary, sentiment, topic)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (title, content, description, source, published, summary, sentiment, topic))
+
+            if c.rowcount > 0:
+                new_count += 1
 
     conn.commit()
-    print(f"Fetched {len(articles)} articles, {new_count} new added (duplicates ignored).")
-    return new_count
-
-# -----------------------
-# Run the fetch if executed directly
-# -----------------------
-if __name__ == "__main__":
-    added = fetch_and_store_news()
-    print(f"Total new articles added: {added}")
     conn.close()
+    print(f"Fetched {total} articles across all topics, {new_count} new added.")
+    return total, new_count
+
+
+if __name__ == "__main__":
+    fetch_and_store()
