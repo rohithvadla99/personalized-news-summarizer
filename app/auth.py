@@ -1,14 +1,5 @@
 """
 auth.py — Google OAuth with DB-backed session tokens.
-
-Session persistence works by:
-1. On login: generate a random token, store it in the DB with user info,
-   and append ?session=TOKEN to the URL
-2. On every reload: read ?session= from the URL, look up user in DB,
-   restore session_state
-3. On logout: delete the token from DB and clear the URL param
-
-This avoids all cookie libraries and works reliably in Streamlit.
 """
 
 import os
@@ -22,7 +13,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from config import DB_PATH
 
 
-# ── DB setup ───────────────────────────────────────────────────────────────
 def _get_conn():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30)
@@ -69,7 +59,6 @@ def _delete_token(token: str) -> None:
     conn.close()
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────
 def _redirect_uri() -> str:
     try:
         uri = st.secrets.get("REDIRECT_URI", "")
@@ -95,47 +84,29 @@ def _set_session(user: dict) -> None:
     st.session_state["user_uid"]          = user["uid"]
 
 
-# ── Core auth functions ────────────────────────────────────────────────────
 def restore_session() -> bool:
-    """
-    On every page load: check if session_state is populated,
-    or if ?session= token exists in the URL and is valid in the DB.
-    """
     if st.session_state.get("user_email"):
         return True
-
     token = st.query_params.get("session", "")
     if not token:
         return False
-
     user = _load_token(token)
     if user:
         _set_session(user)
         st.session_state["session_token"] = token
         return True
-
-    # Token not found — clear it from URL
     st.query_params.clear()
     return False
 
 
 def handle_callback() -> bool:
-    """
-    If ?code= is in the URL (Google redirect), exchange it for user info,
-    create a session token, and redirect to /?session=TOKEN.
-    Skips if a ?session= token is already present (page reload case).
-    """
-    # Already have a session token — don't try to reuse the OAuth code
     if st.query_params.get("session", ""):
         return False
-
     auth_code = st.query_params.get("code", "")
     if not auth_code:
         return False
 
     client_id, client_secret = _get_creds()
-
-    # Exchange code for access token
     token_resp = requests.post(
         "https://oauth2.googleapis.com/token",
         data={
@@ -147,20 +118,16 @@ def handle_callback() -> bool:
         },
         timeout=10,
     )
-
     if not token_resp.ok:
         st.error(f"Google sign-in failed: {token_resp.text}")
         return False
 
     access_token = token_resp.json().get("access_token", "")
-
-    # Get user profile
     user_resp = requests.get(
         "https://www.googleapis.com/oauth2/v2/userinfo",
         headers={"Authorization": f"Bearer {access_token}"},
         timeout=10,
     )
-
     if not user_resp.ok:
         st.error("Could not fetch your Google profile.")
         return False
@@ -173,13 +140,10 @@ def handle_callback() -> bool:
         "uid":          info.get("id", info.get("email", "")),
     }
 
-    # Create session token and save to DB
     token = secrets.token_urlsafe(32)
     _save_token(token, user)
     _set_session(user)
     st.session_state["session_token"] = token
-
-    # Redirect to app with session token in URL
     st.query_params["session"] = token
     return True
 
