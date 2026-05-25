@@ -1,13 +1,4 @@
 """
-api.py — FastAPI REST layer for NewsIQ.
-
-Exposes the news intelligence data as a REST API so external tools
-(trading dashboards, bots, other apps) can pull sentiment scores
-and summaries programmatically.
-
-Run locally:
-    uvicorn api:app --reload --port 8000
-
 Endpoints:
     GET  /                          health check
     GET  /articles                  list articles with filters
@@ -23,8 +14,6 @@ import os
 import sys
 import sqlite3
 
-# Must happen before any local imports — uvicorn spawns subprocesses
-# that don't inherit the parent's sys.path
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
@@ -35,7 +24,6 @@ from pydantic            import BaseModel
 from typing              import Optional
 from datetime            import datetime, timedelta
 
-# Load .env if present (local dev)
 try:
     from dotenv import load_dotenv
     load_dotenv(os.path.join(_HERE, ".env"))
@@ -61,7 +49,6 @@ app = FastAPI(
     redoc_url   = "/redoc",
 )
 
-# Allow all origins for portfolio/demo use
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = ["*"],
@@ -70,8 +57,6 @@ app.add_middleware(
     allow_headers     = ["*"],
 )
 
-
-# ── DB helper ──────────────────────────────────────────────────────────────
 def get_conn():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -79,7 +64,6 @@ def get_conn():
     return conn
 
 
-# ── Auth ───────────────────────────────────────────────────────────────────
 def verify_api_key(x_api_key: str = Header(...)):
     """
     Simple API key auth for write endpoints.
@@ -90,7 +74,6 @@ def verify_api_key(x_api_key: str = Header(...)):
     return x_api_key
 
 
-# ── Models ─────────────────────────────────────────────────────────────────
 class ArticleOut(BaseModel):
     id:          int
     title:       str
@@ -119,7 +102,6 @@ class MetricsOut(BaseModel):
     fetch_runs:      int
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/", tags=["Health"])
 def root():
     """Health check."""
