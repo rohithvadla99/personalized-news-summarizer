@@ -4,16 +4,22 @@ import os
 import sys
 import requests
 import re
-import json
 import pandas as pd
 from transformers import pipeline
 
-# Allow imports from project root (config.py etc.)
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+_APP_DIR    = os.path.dirname(os.path.abspath(__file__))
+_ROOT_DIR   = os.path.join(_APP_DIR, "..")
+_SCRIPTS_DIR = os.path.join(_ROOT_DIR, "scripts")
+for _p in [_APP_DIR, _ROOT_DIR, _SCRIPTS_DIR]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from auth       import handle_callback, restore_session, is_logged_in, get_user, logout, render_login
 from user_prefs import init_user_tables, upsert_user, get_prefs, save_prefs, mark_read, get_read_ids, get_user_stats
-from metrics    import sentiment_trend, source_breakdown, topic_sentiment_scores, reading_time_saved, company_mentions, db_stats
+from metrics    import (sentiment_trend, source_breakdown, topic_sentiment_scores,
+                        reading_time_saved, company_mentions, db_stats,
+                        market_correlation, system_metrics, daily_token_volume)
+from fetch_news import fetch_and_store as async_fetch_and_store
 
 # ─────────────────────────────────────────────
 # Page config
@@ -25,9 +31,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ─────────────────────────────────────────────
-# Paths & constants
-# ─────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH  = os.path.join(BASE_DIR, "data", "news.db")
 
@@ -41,94 +44,161 @@ NEWSAPI_CATEGORIES = {
     "Business": "business",
 }
 
+TOPIC_COLORS = {
+    "Sports":   ("#f0fdf4", "#166534", "#22c55e"),
+    "Tech":     ("#eff6ff", "#1e40af", "#3b82f6"),
+    "Politics": ("#fef9c3", "#854d0e", "#eab308"),
+    "Business": ("#fdf4ff", "#6b21a8", "#a855f7"),
+    "Other":    ("#f8fafc", "#334155", "#94a3b8"),
+}
+
+SENTIMENT_COLOR = {
+    "POSITIVE": ("#dcfce7", "#166534"),
+    "NEGATIVE": ("#fee2e2", "#991b1b"),
+    "NEUTRAL":  ("#dbeafe", "#1e40af"),
+}
+
 SENTIMENT_ICON = {"POSITIVE": "🟢", "NEGATIVE": "🔴", "NEUTRAL": "🔵"}
 
-# ─────────────────────────────────────────────
-# Init DB user tables
-# ─────────────────────────────────────────────
 init_user_tables()
 
 # ─────────────────────────────────────────────
-# Google OAuth — handle redirect callback
-# ─────────────────────────────────────────────
-
-# ─────────────────────────────────────────────
-# Custom CSS
+# CSS — theme-aware using CSS variables
 # ─────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Serif+Display&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&family=DM+Serif+Display&display=swap');
 
-html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
-h1, h2, h3 { font-family: 'DM Serif Display', serif; }
+html, body, [class*="css"], .stMarkdown, .stText {
+    font-family: 'DM Sans', sans-serif !important;
+}
 
-.metric-card {
-    background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
-    border: 1px solid #e2e8f0;
-    border-radius: 12px;
-    padding: 20px 24px;
-    text-align: center;
+/* ── Section headers ── */
+.section-header {
+    font-family: 'DM Serif Display', serif !important;
+    font-size: 28px;
+    font-weight: 400;
+    letter-spacing: -0.5px;
+    margin-bottom: 4px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid rgba(128,128,128,0.2);
 }
-.metric-card .value {
-    font-size: 32px;
-    font-weight: 600;
-    color: #0f172a;
-    font-family: 'DM Serif Display', serif;
-    line-height: 1;
+
+/* ── Sentiment tags — use inline styles instead of classes
+      so they override Streamlit's dark mode resets ── */
+
+/* ── Article expander styling ── */
+.stExpander {
+    border-radius: 10px !important;
+    margin-bottom: 8px !important;
+    border: 1px solid rgba(128,128,128,0.2) !important;
 }
-.metric-card .label {
-    font-size: 12px;
-    color: #64748b;
-    text-transform: uppercase;
-    letter-spacing: .5px;
-    margin-top: 6px;
+.stExpander:hover {
+    border-color: rgba(99,102,241,0.5) !important;
 }
-.article-card {
-    border: 1px solid #e2e8f0;
+/* Make expander summary text wrap properly */
+.stExpander summary {
+    font-size: 14px !important;
+    font-weight: 500 !important;
+    line-height: 1.5 !important;
+    padding: 12px 16px !important;
+}
+/* Read articles — dimmed */
+.stExpander.read-article summary {
+    opacity: 0.5 !important;
+}
+
+/* ── Sidebar ── */
+[data-testid="stSidebar"] {
+    padding-top: 12px;
+}
+[data-testid="stSidebar"] .stRadio label {
+    font-size: 14px;
+    padding: 6px 0;
+}
+
+/* ── Metric cards ── */
+[data-testid="stMetric"] {
     border-radius: 10px;
-    padding: 16px 20px;
-    margin-bottom: 12px;
-    transition: border-color .15s;
+    padding: 4px 8px;
 }
-.article-card:hover { border-color: #6366f1; }
+
+/* ── Hide Streamlit branding ── */
+#MainMenu { visibility: hidden; }
+footer    { visibility: hidden; }
+
+/* ── Topic badge ── */
+.topic-badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    margin-right: 6px;
+}
+
+/* ── Read article button ── */
+.read-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 16px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    text-decoration: none;
+    margin-top: 8px;
+    background: #0f172a;
+    color: #fff !important;
+    transition: opacity .15s;
+}
+.read-btn:hover { opacity: 0.85; }
+
+/* ── User pill ── */
 .user-pill {
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    background: #f1f5f9;
     border-radius: 20px;
     padding: 4px 12px 4px 4px;
     font-size: 13px;
+    background: rgba(128,128,128,0.1);
+    margin-bottom: 8px;
 }
 .pill-avatar {
-    width: 26px;
-    height: 26px;
+    width: 28px;
+    height: 28px;
     border-radius: 50%;
     object-fit: cover;
 }
-.tag {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 11px;
-    font-weight: 500;
+
+/* ── Platform scale card ── */
+.scale-card {
+    border-radius: 10px;
+    padding: 16px 20px;
+    border: 1px solid rgba(128,128,128,0.2);
+    text-align: center;
+    background: rgba(128,128,128,0.05);
 }
-.tag-pos { background: #dcfce7; color: #166534; }
-.tag-neg { background: #fee2e2; color: #991b1b; }
-.tag-neu { background: #dbeafe; color: #1e40af; }
-.section-header {
+.scale-card .sc-value {
     font-family: 'DM Serif Display', serif;
-    font-size: 22px;
-    color: #0f172a;
-    margin-bottom: 16px;
-    padding-bottom: 8px;
-    border-bottom: 2px solid #f1f5f9;
+    font-size: 26px;
+    font-weight: 400;
+    line-height: 1.1;
+}
+.scale-card .sc-label {
+    font-size: 11px;
+    opacity: 0.6;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-top: 4px;
 }
 </style>
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# Model loading (cached)
+# Models
 # ─────────────────────────────────────────────
 @st.cache_resource
 def load_summarizer():
@@ -139,7 +209,7 @@ def load_sentiment():
     return pipeline("sentiment-analysis")
 
 # ─────────────────────────────────────────────
-# NLP helpers
+# Helpers
 # ─────────────────────────────────────────────
 def clean_text(text: str) -> str:
     if not text:
@@ -149,155 +219,113 @@ def clean_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
-def safe_summarize(text: str, summarizer) -> str:
-    words = text.split()
-    if len(words) < 40:
-        return text
-    if len(words) > 600:
-        text = " ".join(words[:600])
-        words = words[:600]
-    min_len = min(30, max(1, len(words) // 4))
-    try:
-        return summarizer(text, max_length=120, min_length=min_len, do_sample=False)[0]["summary_text"]
-    except Exception:
-        return text[:300]
+def sentiment_badge(sentiment: str) -> str:
+    bg, color = SENTIMENT_COLOR.get(sentiment, ("#f1f5f9", "#334155"))
+    return (f'<span style="display:inline-block;padding:2px 10px;border-radius:20px;'
+            f'font-size:11px;font-weight:600;background:{bg};color:{color};'
+            f'letter-spacing:0.3px">{sentiment}</span>')
 
-def analyze_sentiment(text: str, sentiment_analyzer) -> str:
-    if not text:
-        return "NEUTRAL"
-    truncated = " ".join(text.split()[:400])
-    try:
-        return sentiment_analyzer(truncated)[0]["label"].upper()
-    except Exception:
-        return "NEUTRAL"
+def topic_badge(topic: str) -> str:
+    bg, color, _ = TOPIC_COLORS.get(topic, TOPIC_COLORS["Other"])
+    return (f'<span class="topic-badge" style="background:{bg};color:{color}">'
+            f'{topic}</span>')
 
 # ─────────────────────────────────────────────
 # Database
 # ─────────────────────────────────────────────
 def get_connection() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute('''
         CREATE TABLE IF NOT EXISTS articles (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            title       TEXT,
-            content     TEXT,
-            description TEXT,
-            source      TEXT,
-            publishedAt TEXT,
-            summary     TEXT,
-            sentiment   TEXT,
-            topic       TEXT,
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            title             TEXT,
+            content           TEXT,
+            description       TEXT,
+            source            TEXT,
+            publishedAt       TEXT,
+            summary           TEXT,
+            sentiment         TEXT,
+            topic             TEXT,
+            url               TEXT,
+            tokens_processed  INTEGER DEFAULT 0,
             UNIQUE(title, source)
         )
     ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS fetch_log (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            fetched_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+            articles_fetched INTEGER DEFAULT 0,
+            articles_new     INTEGER DEFAULT 0,
+            tokens_processed INTEGER DEFAULT 0,
+            sources_hit      INTEGER DEFAULT 0,
+            avg_compression  REAL DEFAULT 0,
+            duration_sec     REAL DEFAULT 0
+        )
+    ''')
     conn.commit()
+    for col, defn in [("url", "TEXT"), ("tokens_processed", "INTEGER DEFAULT 0")]:
+        try:
+            conn.execute(f"ALTER TABLE articles ADD COLUMN {col} {defn}")
+            conn.commit()
+        except Exception:
+            pass
+    try:
+        conn.execute("ALTER TABLE fetch_log ADD COLUMN duration_sec REAL DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass
     return conn
 
 # ─────────────────────────────────────────────
-# Fetch & store
+# Login gate
 # ─────────────────────────────────────────────
-def fetch_and_store(api_key: str) -> tuple[int, int]:
-    summarizer_model   = load_summarizer()
-    sentiment_model    = load_sentiment()
-    conn               = get_connection()
-    c                  = conn.cursor()
-    total              = 0
-    new_count          = 0
-
-    for topic, category in NEWSAPI_CATEGORIES.items():
-        url = (
-            f"https://newsapi.org/v2/top-headlines"
-            f"?country=us&category={category}&pageSize=10&apiKey={api_key}"
-        )
-        try:
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as e:
-            st.warning(f"Could not fetch {topic}: {e}")
-            continue
-
-        if data.get("status") != "ok":
-            st.warning(f"NewsAPI error for {topic}: {data.get('message')}")
-            continue
-
-        articles = data.get("articles", [])
-        total += len(articles)
-
-        for article in articles:
-            title       = article.get("title") or ""
-            raw_content = article.get("content") or article.get("description") or ""
-            description = article.get("description") or ""
-            source      = article.get("source", {}).get("name") or ""
-            published   = article.get("publishedAt") or ""
-
-            content   = clean_text(raw_content)
-            summary   = safe_summarize(content, summarizer_model)
-            sentiment = analyze_sentiment(content, sentiment_model)
-
-            c.execute('''
-                INSERT OR IGNORE INTO articles
-                    (title, content, description, source, publishedAt, summary, sentiment, topic)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (title, content, description, source, published, summary, sentiment, topic))
-
-            if c.rowcount > 0:
-                new_count += 1
-
-    conn.commit()
-    conn.close()
-    return total, new_count
-
-# ─────────────────────────────────────────────
-# LOGIN GATE
-# ─────────────────────────────────────────────
-handle_callback()    # exchanges ?code= for user info if present
-restore_session()    # restores session from cookie if page was refreshed
+handle_callback()
+restore_session()
 
 if not is_logged_in():
     render_login()
     st.stop()
 
-# On first login, persist user to DB
-user_info = st.session_state.get("user_info", {})
-if user_info and user_info.get("email"):
+# Always upsert the current logged-in user on every session
+_u = get_user()
+if _u.get("email"):
     upsert_user(
-        uid          = user_info.get("id", user_info["email"]),
-        email        = user_info["email"],
-        display_name = user_info.get("name", ""),
-        photo_url    = user_info.get("picture", ""),
+        uid          = _u["uid"],
+        email        = _u["email"],
+        display_name = _u["display_name"],
+        photo_url    = _u["photo_url"],
     )
 
-# ─────────────────────────────────────────────
-# AUTHENTICATED APP
-# ─────────────────────────────────────────────
 user  = get_user()
 uid   = user["uid"]
 prefs = get_prefs(uid)
 
-# ── Sidebar ───────────────────────────────────
+# ─────────────────────────────────────────────
+# Sidebar
+# ─────────────────────────────────────────────
 with st.sidebar:
-    # User pill
     if user["photo_url"]:
         st.markdown(
             f'<div class="user-pill">'
             f'<img class="pill-avatar" src="{user["photo_url"]}">'
-            f'{user["display_name"] or user["email"]}'
+            f'<span>{user["display_name"] or user["email"]}</span>'
             f'</div>',
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
     else:
         st.markdown(f"👤 **{user['display_name'] or user['email']}**")
 
+    page = st.radio(
+        "Navigation",
+        ["📰 Feed", "📊 Dashboard", "⚙️ Preferences"],
+        label_visibility="collapsed",
+    )
+
     st.markdown("---")
 
-    # Navigation
-    page = st.radio("Navigation", ["📰 Feed", "📊 Dashboard", "⚙️ Preferences"], label_visibility="collapsed")
-
-    st.markdown("---")
-
-    # API key
     try:
         api_key = st.secrets.get("NEWS_API_KEY", "")
     except (FileNotFoundError, KeyError):
@@ -306,10 +334,10 @@ with st.sidebar:
         api_key = st.text_input("NewsAPI key", type="password")
 
     if st.button("🔄 Fetch latest news", disabled=not api_key, use_container_width=True):
-        with st.spinner("Fetching & processing articles…"):
+        with st.spinner("Fetching & scraping articles concurrently…"):
             try:
-                total, added = fetch_and_store(api_key)
-                st.success(f"Fetched {total} — {added} new")
+                total, added, duration = async_fetch_and_store(api_key)
+                st.success(f"✓ {added} new articles in {duration}s")
             except Exception as e:
                 st.error(str(e))
 
@@ -317,16 +345,15 @@ with st.sidebar:
     if st.button("Sign out", use_container_width=True):
         logout()
 
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════
 # PAGE: FEED
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════
 if page == "📰 Feed":
     st.markdown('<div class="section-header">Your News Feed</div>', unsafe_allow_html=True)
 
     conn = get_connection()
     c    = conn.cursor()
 
-    # Filter controls
     fcol1, fcol2, fcol3 = st.columns([1, 1, 2])
     with fcol1:
         selected_topic = st.selectbox("Topic", ["All"] + prefs["preferred_topics"])
@@ -340,8 +367,7 @@ if page == "📰 Feed":
     if not selected_sentiment:
         selected_sentiment = ALL_SENTIMENTS
 
-    # Build query
-    base  = "SELECT id, title, summary, sentiment, publishedAt, source, topic FROM articles WHERE 1=1"
+    base   = "SELECT id, title, summary, sentiment, publishedAt, source, topic, url FROM articles WHERE 1=1"
     params = []
     if selected_topic != "All":
         base += " AND topic=?"; params.append(selected_topic)
@@ -358,93 +384,158 @@ if page == "📰 Feed":
     read_ids = get_read_ids(uid)
 
     if not rows:
-        st.info("No articles match your filters. Try fetching the latest news.")
+        st.info("No articles yet — hit **Fetch latest news** in the sidebar.")
     else:
-        # Stats bar
         total_shown = len(rows)
         unread      = sum(1 for r in rows if r[0] not in read_ids)
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Articles shown", total_shown)
-        s2.metric("Unread", unread)
-        s3.metric("Sources", len({r[5] for r in rows}))
+        unique_srcs = len({r[5] for r in rows if r[5]})
+
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Shown",   total_shown)
+        s2.metric("Unread",  unread)
+        s3.metric("Read",    total_shown - unread)
+        s4.metric("Sources", unique_srcs)
 
         st.markdown("<br>", unsafe_allow_html=True)
 
         for row in rows:
-            art_id, title, summary, sentiment, published_at, source, topic = row
-            is_read   = art_id in read_ids
-            sent_class = {"POSITIVE": "tag-pos", "NEGATIVE": "tag-neg"}.get(sentiment, "tag-neu")
+            art_id, title, summary, sentiment, published_at, source, topic, url = row
+            is_read    = art_id in read_ids
             icon       = SENTIMENT_ICON.get(sentiment, "⚪")
-            opacity    = "0.55" if is_read else "1"
+            _, tc, _   = TOPIC_COLORS.get(topic or "Other", TOPIC_COLORS["Other"])
 
-            read_label  = "✓ Read" if is_read else f"{icon} {title}"
-            title_label = f"{'~~' if is_read else ''}{title}{'~~' if is_read else ''}"
-            # Show dimmed title for read articles
-            display_title = f"✓ {title}" if is_read else f"{icon} {title}"
+            display_title = f"✓ {title}" if is_read else f"{icon}  {title}"
+
             with st.expander(display_title, expanded=False):
-                if is_read:
-                    st.caption("_You have already read this article._")
+                # Meta row
+                date_str = published_at[:10] if published_at else ""
                 st.markdown(
-                    f'<span class="tag {sent_class}">{sentiment}</span> '
-                    f'&nbsp;<span style="font-size:12px;color:#94a3b8">{topic} · {source} · {published_at[:10] if published_at else ""}</span>',
+                    sentiment_badge(sentiment or "NEUTRAL") +
+                    topic_badge(topic or "Other") +
+                    f'<span style="font-size:12px;opacity:0.5">{source} · {date_str}</span>',
                     unsafe_allow_html=True,
                 )
+
+                if is_read:
+                    st.caption("_You have already read this article._")
+
                 st.markdown("<br>", unsafe_allow_html=True)
-                st.write(summary or "_No summary available._")
+                st.markdown(f"**{summary or '_No summary available._'}**" if not is_read
+                            else summary or "_No summary available._")
 
-                if not is_read:
-                    if st.button("✓ Mark as read", key=f"read_{art_id}"):
-                        mark_read(uid, art_id)
-                        st.rerun()
+                st.markdown("<br>", unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
+                btn1, btn2 = st.columns([1, 3])
+                with btn1:
+                    if not is_read:
+                        if st.button("✓ Mark as read", key=f"read_{art_id}"):
+                            mark_read(uid, art_id)
+                            st.rerun()
+                with btn2:
+                    if url:
+                        st.markdown(
+                            f'<a class="read-btn" href="{url}" target="_blank">'
+                            f'Read full article →</a>',
+                            unsafe_allow_html=True,
+                        )
+
+# ═════════════════════════════════════════════
 # PAGE: DASHBOARD
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════
 elif page == "📊 Dashboard":
     st.markdown('<div class="section-header">Intelligence Dashboard</div>', unsafe_allow_html=True)
 
-    # ── Top metrics row ───────────────────────
-    stats     = db_stats()
-    time_data = reading_time_saved()
+    stats      = db_stats()
+    time_data  = reading_time_saved()
     user_stats = get_user_stats(uid)
+    sys_m      = system_metrics()
 
+    # ── Row 1: Platform overview ──────────────
+    st.markdown("##### Platform Overview")
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Total articles", stats["total"])
-    m2.metric("News sources",   stats["sources"])
-    m3.metric("Topics covered", stats["topics"])
-    m4.metric("Minutes saved",  f"{time_data['minutes_saved']}m")
-    m5.metric("Compression",    f"{time_data['compression_pct']}%")
+    m1.metric("Total articles",  stats["total"])
+    m2.metric("News sources",    stats["sources"])
+    m3.metric("Topics",          stats["topics"])
+    m4.metric("Minutes saved",   f"{time_data['minutes_saved']}m")
+    m5.metric("Avg compression", f"{time_data['compression_pct']}%")
+
+    # ── Row 2: System scale ───────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("##### System Scale")
+
+    def scale_card(value, label):
+        return (f'<div class="scale-card">'
+                f'<div class="sc-value">{value}</div>'
+                f'<div class="sc-label">{label}</div>'
+                f'</div>')
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    cards = [
+        (f"{sys_m['total_tokens']:,}",   "Tokens processed"),
+        (f"{sys_m['total_words']:,}",    "Words processed"),
+        (str(sys_m["unique_sources"]),   "Sources monitored"),
+        (str(sys_m["total_users"]),      "Registered users"),
+        (str(sys_m["total_reads"]),      "Articles read"),
+        (str(sys_m["total_runs"]),       "Fetch runs"),
+    ]
+    for col, (val, lbl) in zip([c1, c2, c3, c4, c5, c6], cards):
+        col.markdown(scale_card(val, lbl), unsafe_allow_html=True)
+
+    # Daily token throughput
+    vol_df = daily_token_volume(days=30)
+    if not vol_df.empty and len(vol_df) > 1:
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("**Daily token throughput (last 30 days)**")
+        st.bar_chart(vol_df.set_index("date")["tokens"])
 
     st.markdown("---")
 
     # ── Sentiment trend ───────────────────────
-    st.markdown("#### Sentiment Trend (last 7 days)")
-    trend_topic = st.selectbox("Filter by topic", ["All"] + ALL_TOPICS, key="trend_topic")
-    trend_df    = sentiment_trend(days=7, topic=trend_topic)
-
-    if not trend_df.empty and "date" in trend_df.columns:
-        st.line_chart(trend_df.set_index("date")[["POSITIVE", "NEGATIVE", "NEUTRAL"]])
-    else:
-        st.info("Not enough data yet — fetch more articles across multiple days.")
+    st.markdown("##### Sentiment Trend")
+    t1, t2 = st.columns([1, 3])
+    with t1:
+        trend_days  = st.selectbox("Window", [7, 14, 30], key="trend_days")
+        trend_topic = st.selectbox("Topic",  ["All"] + ALL_TOPICS, key="trend_topic")
+    with t2:
+        trend_df = sentiment_trend(days=trend_days, topic=trend_topic)
+        if not trend_df.empty and "date" in trend_df.columns:
+            st.line_chart(
+                trend_df.set_index("date")[["POSITIVE", "NEGATIVE", "NEUTRAL"]],
+                color=["#22c55e", "#ef4444", "#3b82f6"],
+            )
+        else:
+            st.info("Not enough data yet — fetch news across multiple days.")
 
     st.markdown("---")
 
-    # ── Topic sentiment scores ─────────────────
+    # ── Topic scores + Sources ────────────────
     col_a, col_b = st.columns(2)
 
     with col_a:
-        st.markdown("#### Topic Sentiment Scores")
+        st.markdown("##### Topic Sentiment Scores")
         scores_df = topic_sentiment_scores()
         if not scores_df.empty:
             display = scores_df[["topic", "positive_pct", "negative_pct", "net_score"]].copy()
             display.columns = ["Topic", "Positive %", "Negative %", "Net Score"]
-            st.dataframe(display, use_container_width=True, hide_index=True)
+            def color_net_score(val):
+                try:
+                    v = float(val)
+                    if v > 0:   return "color: #166534; font-weight: 600"
+                    if v < 0:   return "color: #991b1b; font-weight: 600"
+                    return ""
+                except Exception:
+                    return ""
+            st.dataframe(
+                display.style.applymap(color_net_score, subset=["Net Score"]),
+                use_container_width=True,
+                hide_index=True,
+            )
         else:
             st.info("Fetch articles to see scores.")
 
     with col_b:
-        st.markdown("#### Top Sources")
-        src_topic = st.selectbox("Filter", ["All"] + ALL_TOPICS, key="src_topic")
+        st.markdown("##### Top Sources")
+        src_topic = st.selectbox("Filter by topic", ["All"] + ALL_TOPICS, key="src_topic")
         src_df    = source_breakdown(topic=src_topic, limit=8)
         if not src_df.empty:
             st.bar_chart(src_df.set_index("source")["count"])
@@ -453,79 +544,114 @@ elif page == "📊 Dashboard":
 
     st.markdown("---")
 
-    # ── Company mention tracker ────────────────
-    st.markdown("#### Company Mention Tracker")
-    st.caption("Track how often specific companies appear in the news and their sentiment")
+    # ── Market correlation ────────────────────
+    st.markdown("##### 📈 Sentiment vs Market Correlation")
+    st.caption("News sentiment score vs S&P 500 / Tech / Finance daily % change")
 
-    tracked = prefs.get("tracked_companies", [])
+    market_days = st.slider("Lookback (days)", 7, 90, 30, 7, key="market_days")
+    with st.spinner("Fetching market data…"):
+        mdata = market_correlation(days=market_days)
+
+    if mdata.get("error"):
+        st.info(mdata["error"])
+    else:
+        df_m    = mdata["combined_df"]
+        corrs   = mdata["correlations"]
+        tickers = mdata["tickers"]
+
+        corr_cols = st.columns(len(corrs))
+        for i, (label, val) in enumerate(corrs.items()):
+            strength = "Strong" if abs(val) > 0.5 else "Moderate" if abs(val) > 0.3 else "Weak"
+            corr_cols[i].metric(label, f"{val:+.3f}", f"{'↑' if val > 0 else '↓'} {strength}")
+
+        tabs = st.tabs(list(corrs.keys()))
+        for tab, ticker_label in zip(tabs, tickers):
+            with tab:
+                pct_col = f"{ticker_label} %"
+                if pct_col not in df_m.columns:
+                    st.info(f"No data for {ticker_label}")
+                    continue
+                chart_df = df_m[["date", "sentiment_score", pct_col]].dropna().copy()
+                chart_df = chart_df.rename(columns={
+                    "sentiment_score": "News Sentiment",
+                    pct_col:          f"{ticker_label} Daily %",
+                }).set_index("date")
+                for col in chart_df.columns:
+                    mn, mx = chart_df[col].min(), chart_df[col].max()
+                    if mx != mn:
+                        chart_df[f"{col} (norm)"] = (chart_df[col] - mn) / (mx - mn)
+                norm_cols = [c for c in chart_df.columns if "norm" in c]
+                if norm_cols:
+                    st.line_chart(chart_df[norm_cols])
+                    st.caption(f"Normalised 0–1. Raw Pearson r = **{corrs.get(ticker_label, 'N/A')}**")
+
+    st.markdown("---")
+
+    # ── Company mentions ──────────────────────
+    st.markdown("##### Company Mention Tracker")
+    tracked       = prefs.get("tracked_companies", [])
     company_input = st.text_input(
-        "Add companies to track (comma-separated)",
+        "Companies to track (comma-separated)",
         value=", ".join(tracked),
-        placeholder="Apple, Tesla, Microsoft, Fed"
+        placeholder="Apple, Tesla, Microsoft",
     )
     companies = [c.strip() for c in company_input.split(",") if c.strip()]
 
     if companies:
         mentions_df = company_mentions(companies)
         if not mentions_df.empty and mentions_df["mentions"].sum() > 0:
-            # Sentiment score colour coding
             def score_colour(val):
-                if val > 0.1:   return "background-color: #dcfce7"
-                if val < -0.1:  return "background-color: #fee2e2"
-                return "background-color: #dbeafe"
-
+                if val > 0.1:  return "background-color: #dcfce7; color: #166534"
+                if val < -0.1: return "background-color: #fee2e2; color: #991b1b"
+                return "background-color: #dbeafe; color: #1e40af"
             st.dataframe(
                 mentions_df.style.applymap(score_colour, subset=["sentiment_score"]),
-                use_container_width=True,
-                hide_index=True,
+                use_container_width=True, hide_index=True,
             )
-            st.caption("Sentiment score: +1 = fully positive, -1 = fully negative, 0 = neutral")
+            st.caption("Score: +1 = fully positive, −1 = fully negative, 0 = neutral")
         else:
-            st.info("None of these companies were found in the current articles. Fetch more news first.")
+            st.info("None of these companies found in current articles.")
 
     st.markdown("---")
 
-    # ── Your personal stats ────────────────────
-    st.markdown("#### Your Reading Stats")
+    # ── Personal reading stats ────────────────
+    st.markdown("##### Your Reading Stats")
     if user_stats["total_read"] == 0:
-        st.info("Start reading articles to see your personal stats.")
+        st.info("Mark articles as read in the Feed to see your stats.")
     else:
         p1, p2, p3 = st.columns(3)
-        p1.metric("Articles read",  user_stats["total_read"])
-        p2.metric("Time saved",     f"{user_stats['time_saved_min']} min")
-        p3.metric("Avg compression", f"{user_stats['avg_compression']}%")
+        p1.metric("Articles read",    user_stats["total_read"])
+        p2.metric("Time saved",       f"{user_stats['time_saved_min']} min")
+        p3.metric("Avg compression",  f"{user_stats['avg_compression']}%")
 
         if user_stats["by_topic"]:
-            st.markdown("**Reading breakdown by topic**")
             topic_df = pd.DataFrame(
                 list(user_stats["by_topic"].items()),
-                columns=["Topic", "Articles read"]
+                columns=["Topic", "Articles read"],
             )
             st.bar_chart(topic_df.set_index("Topic"))
 
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════
 # PAGE: PREFERENCES
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════
 elif page == "⚙️ Preferences":
-    st.markdown('<div class="section-header">Your Preferences</div>', unsafe_allow_html=True)
-    st.caption("Customise your feed. Changes are saved immediately.")
+    st.markdown('<div class="section-header">Preferences</div>', unsafe_allow_html=True)
+    st.caption("Changes are saved when you click Save.")
 
     pref_topics = st.multiselect(
-        "Topics you want to follow",
+        "Topics to follow",
         ALL_TOPICS,
         default=prefs["preferred_topics"],
     )
-
     pref_sentiments = st.multiselect(
-        "Sentiment filter (default for your feed)",
+        "Default sentiment filter",
         ALL_SENTIMENTS,
         default=prefs["preferred_sentiments"],
     )
-
     tracked_raw = st.text_input(
-        "Companies to track in the dashboard (comma-separated)",
+        "Companies to track (comma-separated)",
         value=", ".join(prefs.get("tracked_companies", [])),
-        placeholder="Apple, Tesla, Google"
+        placeholder="Apple, Tesla, Google",
     )
     tracked_companies = [c.strip() for c in tracked_raw.split(",") if c.strip()]
 

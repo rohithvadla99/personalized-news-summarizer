@@ -5,4 +5,4 @@ data/
 *.db
 venv/
 .env
-.streamlit/secrets.toml
+.streamlit/secrets.toml.client_secret.json

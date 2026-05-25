@@ -25,7 +25,8 @@ from config import DB_PATH
 # ── DB setup ───────────────────────────────────────────────────────────────
 def _get_conn():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute('''
         CREATE TABLE IF NOT EXISTS sessions (
             token        TEXT PRIMARY KEY,

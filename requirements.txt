@@ -7,3 +7,8 @@ streamlit==1.41.1
 pandas==2.2.3
 newsapi-python==0.2.7
 python-dotenv==1.0.1
+yfinance==0.2.51
+newspaper3k==0.3.0
+httpx==0.27.0
+fastapi==0.115.0
+uvicorn==0.30.0
